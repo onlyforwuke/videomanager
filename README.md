@@ -60,7 +60,7 @@ pip install PyQt6 psutil
 
 ### 4. 运行程序
 ```bash
-python video_compressor.py
+python videomanager.py
 ```
 
 ## 使用方法
