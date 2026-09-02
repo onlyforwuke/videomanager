@@ -49,6 +49,7 @@ def convert_to_h264(src: str) -> str | None:
         "-crf", CRF,
         "-preset", "slow",
         "-tune", "animation",
+        "-x264-params", "ref=5:bframes=8:b-adapt=2:me=umh:merange=34:subme=10:rc-lookahead=240:trellis=2:aq-mode=3:aq-strength=0.9:psy-rd=1.0:0.15:deblock=-1:-1:qcomp=0.5:partitions=all:no-fast-pskip:direct=auto:scenecut=60",
         "-c:a", "copy",
         "-c:s", "copy",
         "-map_metadata", "0",
