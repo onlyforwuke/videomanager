@@ -85,6 +85,25 @@ TEXT_SUB_CODECS = {"subrip", "ass", "ssa", "webvtt"}
 
 ENCODER_DISPLAY_MAP = {e.display_name: e.name for e in ENCODERS}
 ENCODER_DEFAULT_CRF = {e.display_name: e.default_crf for e in ENCODERS}
+ACTIVE_ENCODER_NAMES: list[str] = list(ENCODER_DISPLAY_MAP.keys())
+
+
+def probe_available_encoder_names() -> set[str]:
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="ignore",
+            creationflags=CREATE_NO_WINDOW, timeout=15
+        )
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1]):
+            names.add(parts[1])
+    return names
 
 # 跨平台兼容
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -234,7 +253,7 @@ def probe_audio_sub_count(path: str) -> tuple[int, int]:
     return audio_cnt, len(sub_streams)
 
 
-def detect_animation(path: str, seconds: int = 20) -> bool:
+def detect_animation(path: str, seconds: int = 8) -> bool:
     try:
         cmd = [
             "ffmpeg", "-v", "error",
@@ -292,7 +311,7 @@ def evaluate_compress_value(codec: str, bitrate_kbps: int, mb_per_min: float) ->
         score += 30
     elif bitrate_kbps > 3500:
         score += 15
-    elif bitrate_kbps < 2500:
+    elif 0 < bitrate_kbps < 2500:
         score -= 20
 
     if mb_per_min > 80:
@@ -571,6 +590,7 @@ class CompressThread(QThread):
         self._stop = False
         self._process: Optional[subprocess.Popen] = None
         self._current_output: Optional[str] = None
+        self._bitrate = 0
 
     def pause(self) -> None:
         if self._process and not self._pause:
@@ -708,10 +728,11 @@ class CompressThread(QThread):
                 "partitions=all:no-fast-pskip:"
                 "direct=auto"
             )
+            rate_args = self._rate_control_args()
             return [
                 "-c:v", "libx264",
                 "-preset", "slow",
-                "-crf", str(self.crf),
+                *rate_args,
                 "-tune", tune_hint,
                 "-x264-params", x264_params,
                 "-pass", "1", "-passlogfile", passlog,
@@ -721,7 +742,7 @@ class CompressThread(QThread):
             return [
                 "-c:v", "libx265",
                 "-preset", "slow",
-                "-crf", str(self.crf),
+                *self._rate_control_args(),
                 "-x265-params", x265_params,
             ]
         return []
@@ -747,10 +768,11 @@ class CompressThread(QThread):
                 "partitions=all:no-fast-pskip:"
                 "direct=auto"
             )
+            rate_args = self._rate_control_args()
             return [
                 "-c:v", "libx264",
                 "-preset", "slow",
-                "-crf", str(self.crf),
+                *rate_args,
                 "-tune", tune_hint,
                 "-x264-params", x264_params,
                 "-pass", "2", "-passlogfile", passlog,
@@ -760,10 +782,15 @@ class CompressThread(QThread):
             return [
                 "-c:v", "libx265",
                 "-preset", "slow",
-                "-crf", str(self.crf),
+                *self._rate_control_args(),
                 "-x265-params", x265_params,
             ]
         return []
+
+    def _rate_control_args(self) -> list[str]:
+        if self._bitrate:
+            return ["-b:v", f"{self._bitrate}k"]
+        return ["-crf", str(self.crf)]
 
     def run(self) -> None:
         total = len(self.files)
@@ -790,10 +817,17 @@ class CompressThread(QThread):
             width, height = probe_resolution(src)
             is_animation = detect_animation(src)
 
+            self._bitrate = 0
+            if self.two_pass and self.encoder in ("libx264", "libx265"):
+                _, src_kbps = probe_video_quality(src)
+                if src_kbps > 0:
+                    self._bitrate = max(800, int(src_kbps * 0.6))
+
             self.log.emit(
                 f"参数: {width}x{height} | "
                 f"{'动画' if is_animation else '实拍'} | "
                 f"encoder={self.encoder} | crf={self.crf}"
+                + (f" | 2pass目标码率={self._bitrate}kbps" if self._bitrate else "")
             )
 
             if self.two_pass and self.encoder in ("libx264", "libx265"):
@@ -964,7 +998,7 @@ class VideoScanner(QWidget):
         row2.setSpacing(10)
         row2.addWidget(QLabel("编码器:"))
         self.combo_encoder = QComboBox()
-        self.combo_encoder.addItems(list(ENCODER_DISPLAY_MAP.keys()))
+        self.combo_encoder.addItems(ACTIVE_ENCODER_NAMES)
         self.combo_encoder.setMinimumWidth(180)
         row2.addWidget(self.combo_encoder)
         row2.addWidget(QLabel("CRF:"))
@@ -1056,6 +1090,11 @@ class VideoScanner(QWidget):
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table)
 
+        # 选中统计
+        self.stats_label = QLabel("")
+        self.stats_label.setObjectName("statusLabel")
+        layout.addWidget(self.stats_label)
+
         # 进度条
         self.progress_file = QProgressBar()
         self.progress_file.setFormat("当前视频: %p%")
@@ -1083,14 +1122,25 @@ class VideoScanner(QWidget):
         self.combo_encoder.currentTextChanged.connect(self.on_encoder_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self._suppress_stats = True
+        self.table.itemChanged.connect(self._on_table_changed)
 
         self.thread: Optional[ScanThread] = None
         self.compress_thread: Optional[CompressThread] = None
         self.log_dialog: Optional[ConvertLogDialog] = None
         self.load_history()
+        self._suppress_stats = False
+        self._refresh_stats()
 
     def on_encoder_changed(self, text: str) -> None:
         self.lineEdit_crf.setText(ENCODER_DEFAULT_CRF.get(text, "21"))
+        encoder = ENCODER_DISPLAY_MAP.get(text, "")
+        supports_two_pass = encoder in ("libx264", "libx265")
+        if supports_two_pass:
+            self.chk_two_pass.setEnabled(True)
+        else:
+            self.chk_two_pass.setChecked(False)
+            self.chk_two_pass.setEnabled(False)
 
     def _toggle_output_dir(self, state: int) -> None:
         self.btn_output_dir.setEnabled(state == 2)
@@ -1127,36 +1177,84 @@ class VideoScanner(QWidget):
             self.status_label.setText(f"拖入 {len(files)} 个文件，正在分析...")
             cache = load_cache()
             count = 0
-            for path in files:
-                info = analyze_video(path, cache)
-                if info:
-                    self.add_video(info)
-                    count += 1
+            self._suppress_stats = True
+            try:
+                for path in files:
+                    info = analyze_video(path, cache)
+                    if info:
+                        self.add_video(info)
+                        count += 1
+            finally:
+                self._suppress_stats = False
             save_cache(cache)
+            self._refresh_stats()
             self.status_label.setText(f"导入完成 - 成功导入 {count} 个文件")
 
     def select_by_stars(self, index: int) -> None:
+        self._suppress_stats = True
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if not item:
+                    continue
+                if index == 0:
+                    item.setCheckState(Qt.CheckState.Checked)
+                    continue
+                score_item = self.table.item(row, 8)
+                if not score_item:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    continue
+                score = score_item.data(Qt.ItemDataRole.UserRole) or 0
+                if index == 1:
+                    checked = score > 0
+                elif index == 2:
+                    checked = score >= 30
+                elif index == 3:
+                    checked = score >= 50
+                else:
+                    checked = score >= 70
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        finally:
+            self._suppress_stats = False
+        self._refresh_stats()
+
+    def _on_table_changed(self, item) -> None:
+        if not self._suppress_stats and item.column() == 0:
+            self._refresh_stats()
+
+    def _refresh_stats(self) -> None:
+        total = 0
+        checked = 0
+        checked_mb = 0.0
+        est_mb = 0.0
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if not item:
+            check_item = self.table.item(row, 0)
+            if not check_item:
                 continue
-            if index == 0:
-                item.setCheckState(Qt.CheckState.Checked)
-                continue
-            score_item = self.table.item(row, 8)
-            if not score_item:
-                item.setCheckState(Qt.CheckState.Unchecked)
-                continue
-            score = score_item.data(Qt.ItemDataRole.UserRole) or 0
-            if index == 1:
-                checked = score > 0
-            elif index == 2:
-                checked = score >= 30
-            elif index == 3:
-                checked = score >= 50
-            else:
-                checked = score >= 70
-            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            total += 1
+            try:
+                size_mb = float(self.table.item(row, 2).text())
+            except Exception:
+                size_mb = 0.0
+            save_item = self.table.item(row, 9)
+            save_pct = 0
+            if save_item:
+                m = re.search(r"(\d+)", save_item.text())
+                if m:
+                    save_pct = int(m.group(1))
+            if check_item.checkState() == Qt.CheckState.Checked:
+                checked += 1
+                checked_mb += size_mb
+                est_mb += size_mb * save_pct / 100.0
+        if total == 0:
+            self.stats_label.setText("暂无视频")
+            return
+        checked_gb = checked_mb / 1024.0
+        est_gb = est_mb / 1024.0
+        self.stats_label.setText(
+            f"共 {total} 个视频 · 已勾选 {checked} 个 · 选中体积 {checked_gb:.2f} GB · "
+            f"预计可释放约 {est_gb:.2f} GB"
+        )
 
     def stop_scan(self) -> None:
         if self.thread:
@@ -1195,21 +1293,27 @@ class VideoScanner(QWidget):
             QMessageBox.warning(self, "提示", "未选择任何视频")
             return
 
-        self.btn_compress.setEnabled(False)
-        self.btn_scan.setEnabled(False)
-        self.btn_import.setEnabled(False)
-        self.btn_stop_scan.setEnabled(False)
-
         selected_text = self.combo_encoder.currentText()
         encoder = ENCODER_DISPLAY_MAP.get(selected_text, "libx264")
-        crf = int(self.lineEdit_crf.text().strip() or "21")
-        output_format = self.combo_format.currentText()
         two_pass = self.chk_two_pass.isChecked()
 
         if two_pass and encoder not in ("libx264", "libx265"):
             QMessageBox.warning(self, "提示", "两遍编码仅支持 libx264 和 libx265 编码器")
-            self.btn_compress.setEnabled(True)
             return
+
+        try:
+            crf = int(self.lineEdit_crf.text().strip())
+        except ValueError:
+            crf = int(ENCODER_DEFAULT_CRF.get(selected_text, "23"))
+            QMessageBox.warning(self, "提示", f"CRF/质量值无效，已使用默认值 {crf}")
+        max_crf = 63 if encoder in ("libvpx-vp9", "libaom-av1") else 51
+        crf = max(0, min(crf, max_crf))
+        output_format = self.combo_format.currentText()
+
+        self.btn_compress.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.btn_import.setEnabled(False)
+        self.btn_stop_scan.setEnabled(False)
 
         self.compress_thread = CompressThread(
             files,
@@ -1343,13 +1447,18 @@ class VideoScanner(QWidget):
         self.status_label.setText(f"正在导入 {len(files)} 个文件...")
         cache = load_cache()
         count = 0
-        for path in files:
-            info = analyze_video(path, cache)
-            if info:
-                self.add_video(info)
-                count += 1
+        self._suppress_stats = True
+        try:
+            for path in files:
+                info = analyze_video(path, cache)
+                if info:
+                    self.add_video(info)
+                    count += 1
+        finally:
+            self._suppress_stats = False
         save_cache(cache)
         self.btn_scan.setEnabled(True)
+        self._refresh_stats()
         self.status_label.setText(f"导入完成 - 成功导入 {count} 个文件")
 
     def save_list(self) -> None:
@@ -1388,6 +1497,7 @@ class VideoScanner(QWidget):
                 existing.add(item.text())
         self.btn_load_list.setEnabled(False)
         self.status_label.setText("正在加载列表...")
+        self._suppress_stats = True
         self._load_thread = LoadListThread(path, existing)
         self._load_thread.video_found.connect(self.add_video)
         self._load_thread.finished.connect(self._load_list_done)
@@ -1396,10 +1506,14 @@ class VideoScanner(QWidget):
 
     def _load_list_done(self, count: int) -> None:
         self.btn_load_list.setEnabled(True)
+        self._suppress_stats = False
+        self._refresh_stats()
         self.status_label.setText(f"加载完成 - 新增 {count} 个文件")
 
     def _load_list_error(self, msg: str) -> None:
         self.btn_load_list.setEnabled(True)
+        self._suppress_stats = False
+        self._refresh_stats()
         QMessageBox.critical(self, "错误", f"加载失败: {msg}")
 
     def update_progress(self, file_percent: int, total_percent: int) -> None:
@@ -1433,6 +1547,7 @@ class VideoScanner(QWidget):
 
         if changed:
             save_cache(cache)
+        self._refresh_stats()
 
     def load_history(self) -> None:
         for v in load_cache().values():
@@ -1449,6 +1564,7 @@ class VideoScanner(QWidget):
         self.btn_compress.setEnabled(False)
         self.status_label.setText(f"正在扫描: {folder}...")
 
+        self._suppress_stats = True
         self.thread = ScanThread(folder)
         self.thread.video_found.connect(self.add_video)
         self.thread.scan_finished.connect(self.scan_done)
@@ -1459,6 +1575,8 @@ class VideoScanner(QWidget):
         self.btn_import.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
         self.btn_compress.setEnabled(True)
+        self._suppress_stats = False
+        self._refresh_stats()
         self.status_label.setText(f"扫描完成 - 共 {self.table.rowCount()} 个视频文件")
 
 
@@ -1589,6 +1707,13 @@ def main():
         }
     """)
     
+    global ACTIVE_ENCODER_NAMES
+    available = probe_available_encoder_names()
+    if available:
+        active = [e.display_name for e in ENCODERS if e.name in available]
+        if active:
+            ACTIVE_ENCODER_NAMES = active
+
     win = VideoScanner()
     win.show()
     sys.exit(app.exec())
